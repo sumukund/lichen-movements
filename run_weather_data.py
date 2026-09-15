@@ -3,7 +3,7 @@ import time
 import requests
 
 # Set your Arduino Mega COM port (e.g., 'COM3' on Windows or '/dev/cu.usbmodemXXXX' on Mac)
-arduino_port = "COM7"
+arduino_port = "/dev/cu.usbmodem143201"
 baud_rate = 9600
 
 ser = serial.Serial(arduino_port, baud_rate, timeout=1)
@@ -17,6 +17,11 @@ while True:
     current = response["current"]
     temp = current["temperature_2m"]
     hum = current["relative_humidity_2m"]
+    
+    print(response)
+    print(current)
+    print(temp)
+    print(hum)
 
     payload = f"{temp},{hum}\n"
     ser.write(payload.encode("utf-8"))
