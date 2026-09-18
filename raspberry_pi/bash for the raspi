@@ -1,0 +1,6 @@
+### those damn bash commands
+
+
+sudo apt-get update -o Acquire::http::No-Cache=true -o Acquire::broken::No-Cache=true
+sudo apt-get install git
+
