@@ -1,99 +1,189 @@
 #include <Servo.h>
-#include "minneapolis_humidity_data.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
-// --- Servo setup ---
+// Receives live weather lines from run_weather_data.py:
+//     humidity_percent,precipitation_mm_per_hour\n
 const uint8_t NUM_SERVOS = 6;
 Servo servos[NUM_SERVOS];
 const uint8_t servoPins[NUM_SERVOS] = {8, 9, 10, 11, 12, 13};
 
-// A new calendar day is shown once per minute: 365 days = 365 minutes.
-const unsigned long DAY_INTERVAL_MS = 60000UL;
-const unsigned long SERVO_UPDATE_INTERVAL_MS = 100UL;
-uint16_t dayIndex = 0;  // Jan 1 at reset; advances through Dec 31.
-unsigned long lastDayChangeMs = 0;
-unsigned long lastServoUpdateMs = 0;
-int startAngle = 0;
-int targetAngle = 0;
-int appliedAngle = -1;
+// Dry weather completes one 0 -> target -> 0 sweep in the same five minutes
+// between API updates. Rain shortens the sweep, so wet weather moves faster.
+const unsigned long DRY_SWEEP_DURATION_MS = 75000UL;
+const unsigned long WET_SWEEP_DURATION_MS = 75000UL;
+const float RAIN_FOR_MAX_SPEED_MM_H = 5.0;
 
-void exponential_humidity_to_servo_angle(float humidity, int &angle) {
-  if (humidity <= 70) {
-    // Minimal movement for humidity 0-70%
-    angle = map(constrain(humidity, 0, 70), 0, 70, 0, 50);
-  } else {
-    // Exponential scaling for humidity 70-100%
-    float excessHumidity = humidity - 70;
-    float expScaled = pow(1.05, excessHumidity); // Exponential growth with base 1.05
-    angle = map(expScaled * 100, 100, pow(1.05, 30) * 100, 50, 180); // Map to 50-180 degrees
+int appliedAngle = 0;
+int targetAngle = 0;
+bool movingUp = true;
+float currentHumidity = 0.0;
+float currentPrecipitation = 0.0;
+unsigned long stepDelayMs = 1000UL;
+unsigned long lastServoStepMs = 0;
+
+const uint8_t WEATHER_BUFFER_SIZE = 40;
+char weatherBuffer[WEATHER_BUFFER_SIZE];
+uint8_t weatherBufferLength = 0;
+
+
+float clampFloat(float value, float minimum, float maximum) {
+  if (value < minimum) return minimum;
+  if (value > maximum) return maximum;
+  return value;
+}
+
+
+int humidityToServoAngle(float humidity) {
+  // Same humidity-to-angle function used by the Raspberry Pi controller.
+  humidity = clampFloat(humidity, 0.0, 100.0);
+  if (humidity <= 70.0) {
+    return (int)round((humidity / 70.0) * 50.0);
+  }
+
+  float excessHumidity = humidity - 70.0;
+  float minimum = 100.0;
+  float maximum = pow(1.05, 30.0) * 100.0;
+  float scaled = (pow(1.05, excessHumidity) * 100.0 - minimum) /
+                 (maximum - minimum);
+  return (int)round(clampFloat(50.0 + scaled * 130.0, 0.0, 180.0));
+}
+
+
+unsigned long sweepDurationForPrecipitation(float precipitation) {
+  float rainStrength = clampFloat(
+    precipitation / RAIN_FOR_MAX_SPEED_MM_H, 0.0, 1.0
+  );
+  float duration = DRY_SWEEP_DURATION_MS - rainStrength *
+                   (DRY_SWEEP_DURATION_MS - WET_SWEEP_DURATION_MS);
+  return (unsigned long)round(duration);
+}
+
+
+unsigned long stepDelayForWeather(int angle, float precipitation) {
+  // There are angle steps on the way up and the way down. This makes a dry
+  // full sweep span the API interval regardless of the humidity target.
+  if (angle <= 0) {
+    return DRY_SWEEP_DURATION_MS;
+  }
+  return max(1UL, sweepDurationForPrecipitation(precipitation) /
+                  (unsigned long)(2 * angle));
+}
+
+
+void writeAllServos(int angle) {
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    servos[i].write(angle);
   }
 }
 
-int humidityAngleForDay(uint16_t index) {
-  float humidity = MINNEAPOLIS_HUMIDITY_BY_DAY[index];
-  int angle;
-  exponential_humidity_to_servo_angle(humidity, angle);
-  return angle;
+
+void applyWeather(float humidity, float precipitation) {
+  currentHumidity = clampFloat(humidity, 0.0, 100.0);
+  currentPrecipitation = max(0.0f, precipitation);
+  targetAngle = humidityToServoAngle(currentHumidity);
+  stepDelayMs = stepDelayForWeather(targetAngle, currentPrecipitation);
+
+  if (targetAngle == 0) {
+    appliedAngle = 0;
+    movingUp = true;
+    writeAllServos(appliedAngle);
+  }
+
+  // Keep the current motion continuous when weather changes. If the new
+  // target is below the current angle, immediately head back toward zero.
+  if (appliedAngle >= targetAngle) {
+    movingUp = false;
+  } else if (appliedAngle <= 0) {
+    movingUp = true;
+  }
+
+  Serial.print("Humidity: ");
+  Serial.print(currentHumidity, 1);
+  Serial.print("% | Precipitation: ");
+  Serial.print(currentPrecipitation, 2);
+  Serial.print(" mm/h | Target: ");
+  Serial.print(targetAngle);
+  Serial.print(" deg | Full sweep: ");
+  Serial.print(sweepDurationForPrecipitation(currentPrecipitation) / 1000.0, 1);
+  Serial.print(" s | Step delay: ");
+  Serial.print(stepDelayMs);
+  Serial.println(" ms");
 }
 
-void printCurrentDay() {
-  float humidity = MINNEAPOLIS_HUMIDITY_BY_DAY[dayIndex];
 
-  Serial.print("Day ");
-  Serial.print(dayIndex + 1);
-  Serial.print(" / ");
-  Serial.print(HUMIDITY_DAY_COUNT);
-  Serial.print("  humidity: ");
-  Serial.print(humidity, 0);
-  Serial.print("%  target servo angle: ");
-  Serial.println(targetAngle);
+void readWeatherSerial() {
+  while (Serial.available() > 0) {
+    char character = (char)Serial.read();
+
+    if (character == '\r') {
+      continue;
+    }
+    if (character == '\n') {
+      weatherBuffer[weatherBufferLength] = '\0';
+      char *comma = strchr(weatherBuffer, ',');
+      if (comma != NULL) {
+        *comma = '\0';
+        char *humidityEnd;
+        char *precipitationEnd;
+        float humidity = strtof(weatherBuffer, &humidityEnd);
+        float precipitation = strtof(comma + 1, &precipitationEnd);
+
+        if (humidityEnd != weatherBuffer && precipitationEnd != comma + 1) {
+          applyWeather(humidity, precipitation);
+        } else {
+          Serial.println("Ignored invalid weather payload.");
+        }
+      } else if (weatherBufferLength > 0) {
+        Serial.println("Ignored weather payload without a comma.");
+      }
+      weatherBufferLength = 0;
+    } else if (weatherBufferLength < WEATHER_BUFFER_SIZE - 1) {
+      weatherBuffer[weatherBufferLength++] = character;
+    } else {
+      // Discard an overlong line so a partial value is never applied.
+      weatherBufferLength = 0;
+      Serial.println("Ignored overlong weather payload.");
+    }
+  }
 }
+
 
 void updateServoPosition(unsigned long now) {
-  if (now - lastServoUpdateMs < SERVO_UPDATE_INTERVAL_MS) {
+  if (targetAngle <= 0 || now - lastServoStepMs < stepDelayMs) {
     return;
   }
-  lastServoUpdateMs = now;
 
-  // Ease from the prior day's angle to this day's angle over its full minute.
-  unsigned long elapsed = now - lastDayChangeMs;
-  if (elapsed > DAY_INTERVAL_MS) {
-    elapsed = DAY_INTERVAL_MS;
-  }
-  int angle = startAngle + ((targetAngle - startAngle) * (long)elapsed) / DAY_INTERVAL_MS;
-
-  if (angle != appliedAngle) {
-    for (uint8_t i = 0; i < NUM_SERVOS; i++) {
-      servos[i].write(angle);
+  lastServoStepMs = now;
+  if (movingUp) {
+    appliedAngle++;
+    if (appliedAngle >= targetAngle) {
+      appliedAngle = targetAngle;
+      movingUp = false;
     }
-    appliedAngle = angle;
+  } else {
+    appliedAngle--;
+    if (appliedAngle <= 0) {
+      appliedAngle = 0;
+      movingUp = true;
+    }
   }
+  writeAllServos(appliedAngle);
 }
+
 
 void setup() {
   Serial.begin(9600);
-
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     servos[i].attach(servoPins[i]);
   }
-
-  targetAngle = humidityAngleForDay(dayIndex);
-  startAngle = targetAngle;
-  appliedAngle = targetAngle;
-  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
-    servos[i].write(appliedAngle);
-  }
-  printCurrentDay();
-  lastDayChangeMs = millis();
+  writeAllServos(appliedAngle);
+  Serial.println("Weather yarn servo controller ready.");
 }
 
-void loop() {
-  if (millis() - lastDayChangeMs >= DAY_INTERVAL_MS) {
-    lastDayChangeMs += DAY_INTERVAL_MS;
-    startAngle = targetAngle;
-    dayIndex = (dayIndex + 1) % HUMIDITY_DAY_COUNT;
-    targetAngle = humidityAngleForDay(dayIndex);
-    printCurrentDay();
-  }
 
+void loop() {
+  readWeatherSerial();
   updateServoPosition(millis());
 }

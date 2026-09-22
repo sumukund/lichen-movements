@@ -1,101 +1,263 @@
+#!/usr/bin/env python3
+"""
+Weather yarn servo controller for Raspberry Pi.
+
+Fetches live weather (relative humidity + precipitation) from the free
+Open-Meteo API (no API key needed) and sweeps all servos continuously
+0 -> target -> 0 -> target ... until the next refresh, then re-targets.
+
+SETUP
+    sudo apt install python3-gpiozero python3-pigpio pigpio
+    sudo systemctl enable --now pigpiod      # steadier servo PWM (Pi 4 and older)
+
+RUN
+    python3 weather_yarn_servos.py --lat 12.34 --lon -56.78
+
+NOTES
+    * Power the servos from an external 5 V supply (not the Pi's 5 V pin) and
+      connect its ground to a Pi ground pin.
+    * SERVO_PINS are BCM GPIO numbers - change them to match your wiring.
+"""
+
+import argparse
+import json
 import math
+import signal
+import sys
+import threading
 import time
-import requests
+import urllib.parse
+import urllib.request
+
 from gpiozero import AngularServo
 
-# --- Configuration ---
-# Coordinates for Minneapolis (change if needed)
-LATITUDE = 44.9778
-LONGITUDE = -93.2650
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+LATITUDE = None   
+LONGITUDE = None  
 
-# GPIO pins corresponding to the 6 servos
-SERVO_PINS = [18, 23, 24, 25, 12, 16]
+SERVO_PINS = [11, 12, 13, 15, 16, 18, 19, 22, 23, 24]   # BCM numbering (NOT the Arduino pins)
 
-# Initialize servos with explicit pulse widths for standard 0-180° hobby servos
-servos = [
-    AngularServo(
-        pin, min_angle=0, max_angle=180, min_pulse_width=0.0005, max_pulse_width=0.0025
+REFRESH_INTERVAL_S = 600     # how often to pull new weather
+RETRY_INTERVAL_S = 60        # retry delay if an API call fails
+
+DRY_SWEEP_DURATION_S = 75.0
+WET_SWEEP_DURATION_S = 60.0
+RAIN_FOR_MAX_SPEED_MM_H = 5.0
+
+TICK_S = 0.02                # motion update rate (50 Hz)
+
+# Same pulse range the Arduino Servo library uses (544-2400 us)
+MIN_PULSE_S = 0.544 / 1000
+MAX_PULSE_S = 2.400 / 1000
+
+
+# ----------------------------------------------------------------------------
+# Weather -> motion math (ported 1:1 from the Arduino sketch)
+# ----------------------------------------------------------------------------
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def round_half_up(x):
+    # Matches C's round() (Python's round() uses banker's rounding)
+    return int(math.floor(x + 0.5))
+
+
+def humidity_to_servo_angle(humidity):
+    humidity = clamp(humidity, 0.0, 100.0)
+    if humidity <= 70.0:
+        return round_half_up(humidity / 70.0 * 50.0)
+
+    excess = humidity - 70.0
+    minimum = 100.0
+    maximum = 1.05 ** 30 * 100.0
+    scaled = (1.05 ** excess * 100.0 - minimum) / (maximum - minimum)
+    return round_half_up(clamp(50.0 + scaled * 130.0, 0.0, 180.0))
+
+
+def sweep_duration_for_precipitation(precipitation):
+    rain_strength = clamp(precipitation / RAIN_FOR_MAX_SPEED_MM_H, 0.0, 1.0)
+    return DRY_SWEEP_DURATION_S - rain_strength * (
+        DRY_SWEEP_DURATION_S - WET_SWEEP_DURATION_S
     )
-    for pin in SERVO_PINS
-]
 
 
-def exponential_humidity_to_servo_angle(humidity):
-  """Exact math port of your C++ exponential scaling function."""
-  if humidity <= 70:
-    # Minimal movement for humidity 0-70%
-    # Python equivalent of map()
-    return (humidity / 70.0) * 50.0
-  else:
-    excess_humidity = humidity - 70.0
-    exp_scaled = math.pow(1.05, excess_humidity)
-    base_min = math.pow(1.05, 0) * 100.0
-    base_max = math.pow(1.05, 30) * 100.0
-    # Map range [base_min, base_max] to [50, 180]
-    scaled_val = (exp_scaled * 100.0 - base_min) / (base_max - base_min)
-    return 50.0 + scaled_val * 130.0
+# ----------------------------------------------------------------------------
+# Weather API
+# ----------------------------------------------------------------------------
+def fetch_weather(lat, lon):
+    """Return (relative_humidity_percent, precipitation_mm_per_hour)."""
+    query = urllib.parse.urlencode({
+        "latitude": lat,
+        "longitude": lon,
+        "current": "relative_humidity_2m,precipitation",
+    })
+    url = f"https://api.open-meteo.com/v1/forecast?{query}"
+    with urllib.request.urlopen(url, timeout=10) as response:
+        data = json.load(response)
+    current = data["current"]
+    return float(current["relative_humidity_2m"]), float(current["precipitation"])
 
 
-def fetch_current_humidity():
-  """Fetches real-time relative humidity from Open-Meteo API."""
-  url = "https://api.open-meteo.com/v1/forecast"
-  params = {
-      "latitude": LATITUDE,
-      "longitude": LONGITUDE,
-      "hourly": "relative_humidity_2m",
-      "timezone": "auto",
-  }
-  try:
-    response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-    # Grab the most recent hourly humidity value from the timeline
-    humidity = data["hourly"]["relative_humidity_2m"][-1]
-    return float(humidity)
-  except Exception as e:
-    print(f"Error fetching weather data: {e}")
-    return None
+class WeatherPoller(threading.Thread):
+    """Fetches weather in the background so a slow network never stalls the servos."""
+
+    def __init__(self, lat, lon):
+        super().__init__(daemon=True)
+        self.lat, self.lon = lat, lon
+        self._lock = threading.Lock()
+        self._latest = None
+        self._halt = threading.Event()
+
+    def run(self):
+        while not self._halt.is_set():
+            try:
+                reading = fetch_weather(self.lat, self.lon)
+                with self._lock:
+                    self._latest = reading
+                wait = REFRESH_INTERVAL_S
+            except Exception as exc:  # network down, bad JSON, etc.
+                print(f"Weather fetch failed ({exc}); retrying in {RETRY_INTERVAL_S}s.")
+                wait = RETRY_INTERVAL_S
+            self._halt.wait(wait)
+
+    def take_latest(self):
+        """Return a fresh (humidity, precipitation) once, else None."""
+        with self._lock:
+            reading, self._latest = self._latest, None
+        return reading
+
+    def stop(self):
+        self._halt.set()
 
 
-def set_all_servos(angle):
-  """Updates all 6 servos to a target angle (0 to 180)."""
-  for servo in servos:
-    servo.angle = angle
+# ----------------------------------------------------------------------------
+# Servo motion
+# ----------------------------------------------------------------------------
+class YarnSweeper:
+    def __init__(self, servos):
+        self.servos = servos
+        self.angle = 0.0
+        self.target = 0
+        self.moving_up = True
+        self.duration_s = DRY_SWEEP_DURATION_S
+        self._last_written = None
 
+    def apply_weather(self, humidity, precipitation):
+        humidity = clamp(humidity, 0.0, 100.0)
+        precipitation = max(0.0, precipitation)
+        self.target = humidity_to_servo_angle(humidity)
+        self.duration_s = sweep_duration_for_precipitation(precipitation)
 
-def main():
-  print("Starting Real-Time Weather Servo Controller...")
+        if self.target == 0:
+            self.angle = 0.0
+            self.moving_up = True
+        elif self.angle >= self.target:
+            self.moving_up = False
+        elif self.angle <= 0:
+            self.moving_up = True
 
-  # Initial fetch and setup
-  current_humidity = fetch_current_humidity()
-  if current_humidity is None:
-    current_humidity = 50.0  # Fallback default
-
-  target_angle = exponential_humidity_to_servo_angle(current_humidity)
-  print(
-      f"Initial Humidity: {current_humidity}% | Target Angle: {target_angle:.1f}°"
-  )
-  set_all_servos(target_angle)
-
-  # Loop to poll Open-Meteo API every 15 minutes (weather updates hourly, but 15m is safe)
-  POLL_INTERVAL_SEC = 900
-
-  try:
-    while True:
-      time.sleep(POLL_INTERVAL_SEC)
-      new_humidity = fetch_current_humidity()
-      if new_humidity is not None:
-        target_angle = exponential_humidity_to_servo_angle(new_humidity)
         print(
-            f"Updated Humidity: {new_humidity}% | New Target Angle:"
-            f" {target_angle:.1f}°"
+            f"Humidity: {humidity:.1f}% | Precipitation: {precipitation:.2f} mm/h | "
+            f"Target: {self.target} deg | Full sweep: {self.duration_s:.1f} s"
         )
-        set_all_servos(target_angle)
-  except KeyboardInterrupt:
-    print("\nProgram stopped by user. Detaching servos.")
-    for servo in servos:
-      servo.detach()
+
+    def update(self, dt):
+        """Advance the sweep by dt seconds."""
+        if self.target > 0:
+            step = (2.0 * self.target / self.duration_s) * dt  # deg this tick
+            if self.moving_up:
+                self.angle += step
+                if self.angle >= self.target:
+                    self.angle = float(self.target)
+                    self.moving_up = False
+            else:
+                self.angle -= step
+                if self.angle <= 0:
+                    self.angle = 0.0
+                    self.moving_up = True
+        self._write(self.angle)
+
+    def _write(self, angle):
+        angle = round(clamp(angle, 0.0, 180.0), 1)
+        if angle == self._last_written:
+            return
+        self._last_written = angle
+        for servo in self.servos:
+            servo.angle = angle
+
+    def park(self):
+        self._write(0.0)
+        time.sleep(0.5)
+
+
+def make_pin_factory():
+    """Prefer pigpio (hardware-timed PWM, no jitter); fall back to gpiozero's default."""
+    try:
+        from gpiozero.pins.pigpio import PiGPIOFactory
+        return PiGPIOFactory()
+    except Exception as exc:
+        print(f"pigpio unavailable ({exc}); using default pin factory (servos may jitter).")
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Weather yarn servo controller")
+    parser.add_argument("--lat", type=float, default=LATITUDE)
+    parser.add_argument("--lon", type=float, default=LONGITUDE)
+    args = parser.parse_args()
+    if args.lat is None or args.lon is None:
+        parser.error("set --lat and --lon (or LATITUDE / LONGITUDE at the top of the file)")
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # clean stop under systemd
+
+    factory = make_pin_factory()
+    servos = [
+        AngularServo(
+            pin,
+            min_angle=0,
+            max_angle=180,
+            initial_angle=0,
+            min_pulse_width=MIN_PULSE_S,
+            max_pulse_width=MAX_PULSE_S,
+            pin_factory=factory,
+        )
+        for pin in SERVO_PINS
+    ]
+
+    sweeper = YarnSweeper(servos)
+    poller = WeatherPoller(args.lat, args.lon)
+    poller.start()
+    print("Weather yarn servo controller ready.")
+
+    last = time.monotonic()
+    try:
+        while True:
+            now = time.monotonic()
+            dt = min(now - last, 0.5)  # guard against long stalls
+            last = now
+
+            reading = poller.take_latest()
+            if reading is not None:
+                sweeper.apply_weather(*reading)
+
+            sweeper.update(dt)
+            time.sleep(TICK_S)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        poller.stop()
+        sweeper.park()
+        for servo in servos:
+            servo.detach()
+            servo.close()
+        print("Stopped.")
 
 
 if __name__ == "__main__":
-  main()
+    main()
