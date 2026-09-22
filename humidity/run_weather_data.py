@@ -1,7 +1,4 @@
-"""Send live Minneapolis humidity and precipitation to an Arduino Mega.
-
-The Mega receives lines in the form ``humidity,precipitation`` and calculates
-the yarn-servo angle and rain-driven movement speed itself.
+"""FOR ARDUINO!
 """
 
 import argparse

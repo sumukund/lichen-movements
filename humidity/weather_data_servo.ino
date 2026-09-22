@@ -1,3 +1,5 @@
+// FOR ARDUINO and 
+
 #include <Servo.h>
 #include <math.h>
 #include <stdlib.h>
@@ -9,8 +11,6 @@ const uint8_t NUM_SERVOS = 6;
 Servo servos[NUM_SERVOS];
 const uint8_t servoPins[NUM_SERVOS] = {8, 9, 10, 11, 12, 13};
 
-// Dry weather completes one 0 -> target -> 0 sweep in the same five minutes
-// between API updates. Rain shortens the sweep, so wet weather moves faster.
 const unsigned long DRY_SWEEP_DURATION_MS = 75000UL;
 const unsigned long WET_SWEEP_DURATION_MS = 75000UL;
 const float RAIN_FOR_MAX_SPEED_MM_H = 5.0;
@@ -36,7 +36,6 @@ float clampFloat(float value, float minimum, float maximum) {
 
 
 int humidityToServoAngle(float humidity) {
-  // Same humidity-to-angle function used by the Raspberry Pi controller.
   humidity = clampFloat(humidity, 0.0, 100.0);
   if (humidity <= 70.0) {
     return (int)round((humidity / 70.0) * 50.0);
@@ -62,8 +61,6 @@ unsigned long sweepDurationForPrecipitation(float precipitation) {
 
 
 unsigned long stepDelayForWeather(int angle, float precipitation) {
-  // There are angle steps on the way up and the way down. This makes a dry
-  // full sweep span the API interval regardless of the humidity target.
   if (angle <= 0) {
     return DRY_SWEEP_DURATION_MS;
   }
@@ -91,8 +88,6 @@ void applyWeather(float humidity, float precipitation) {
     writeAllServos(appliedAngle);
   }
 
-  // Keep the current motion continuous when weather changes. If the new
-  // target is below the current angle, immediately head back toward zero.
   if (appliedAngle >= targetAngle) {
     movingUp = false;
   } else if (appliedAngle <= 0) {

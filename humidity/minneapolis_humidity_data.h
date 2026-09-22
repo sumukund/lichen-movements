@@ -1,12 +1,5 @@
 // Minneapolis, MN daily relative-humidity climatology.
-//
-// Each entry is one calendar day, beginning January 1 (index 0) and ending
-// December 31 (index 364). Values are integer percent relative humidity.
-// They are averages of Open-Meteo ERA5-Land daily mean relative humidity at
-// 44.9778, -93.2650 for 2015-01-01 through 2025-12-31, rounded to the nearest
-// whole percent. February 29 is deliberately omitted so the table is always
-// exactly one 365-day cycle.
-// Source/query: https://archive-api.open-meteo.com/v1/archive
+// HISTORICAL DATA FROM 2025, just for TESTING ONLY
 
 #pragma once
 
