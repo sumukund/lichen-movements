@@ -1,258 +1,290 @@
 #!/usr/bin/env python3
 """
-Weather yarn servo controller for Raspberry Pi.
+Weather yarn servo controller - Raspberry Pi port of the Arduino sketch.
 
-Fetches live weather (relative humidity + precipitation) from the free
-Open-Meteo API (no API key needed) and sweeps all servos continuously
-0 -> target -> 0 -> target ... until the next refresh, then re-targets.
+Every 15 minutes: fetch humidity + precipitation, then
+  * humidity      -> target angle
+  * precipitation -> sweep speed (rain makes the servos move faster)
+and move all servos 0 -> target -> 0 -> target ... one degree at a time
+until the next refresh.
 
-SETUP
-    sudo apt install python3-gpiozero python3-pigpio pigpio
-    sudo systemctl enable --now pigpiod      # steadier servo PWM (Pi 4 and older)
+SETUP (Pi 3B)
+    sudo apt install pigpio python3-pigpio python3-gpiozero
+    sudo systemctl enable --now pigpiod
 
 RUN
-    python3 weather_yarn_servos.py --lat 12.34 --lon -56.78
-
-NOTES
-    * Power the servos from an external 5 V supply (not the Pi's 5 V pin) and
-      connect its ground to a Pi ground pin.
-    * SERVO_PINS are BCM GPIO numbers - change them to match your wiring.
+    python3 weather_yarn_servos.py --lat 12.34 --lon -56.78 --pins 17,18,27,22,23,24
 """
 
 import argparse
+import csv
+from datetime import date, datetime, timedelta
 import json
 import math
-import signal
-import sys
-import threading
+from pathlib import Path
 import time
-import urllib.parse
-import urllib.request
+from urllib.parse import urlencode
+from urllib.request import urlopen
+import openmeteo_requests
 
+import pandas as pd
+import requests_cache
 from gpiozero import AngularServo
+from retry_requests import retry
 
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
-LATITUDE = None   
-LONGITUDE = None  
+LATITUDE = None  # or use --lat / --lon
+LONGITUDE = None
 
-SERVO_PINS = [11, 12, 13, 15, 16, 18, 19, 22, 23, 24]   # BCM numbering (NOT the Arduino pins)
+SERVO_PINS = [17, 18, 21, 22, 23, 24, 25, 19, 26, 20]  # BCM GPIO numbers (or use --pins)
 
-REFRESH_INTERVAL_S = 600     # how often to pull new weather
-RETRY_INTERVAL_S = 60        # retry delay if an API call fails
+REFRESH_S = 15 * 60  # next API refresh
+RETRY_S = 60  # if the API call fails, try again sooner
 
-DRY_SWEEP_DURATION_S = 75.0
-WET_SWEEP_DURATION_S = 60.0
-RAIN_FOR_MAX_SPEED_MM_H = 5.0
-
-TICK_S = 0.02                # motion update rate (50 Hz)
-
-# Same pulse range the Arduino Servo library uses (544-2400 us)
-MIN_PULSE_S = 0.544 / 1000
-MAX_PULSE_S = 2.400 / 1000
+# Time for one full 0 -> target -> 0 cycle.
+DRY_SWEEP_DURATION_S = 75.0  # no rain
+WET_SWEEP_DURATION_S = 25.0  # heavy rain (3x faster)
+RAIN_FOR_MAX_SPEED_MM_H = 5.0  # rain rate at/above which speed is maxed
+HISTORICAL_FILE = Path(__file__).with_name("twin_cities_weather_history.csv")
+HISTORICAL_LATITUDE = 44.9778
+HISTORICAL_LONGITUDE = -93.2650
 
 
-# ----------------------------------------------------------------------------
-# Weather -> motion math (ported 1:1 from the Arduino sketch)
-# ----------------------------------------------------------------------------
+# ---------- calculations ----------
+
+
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
 def round_half_up(x):
-    # Matches C's round() (Python's round() uses banker's rounding)
-    return int(math.floor(x + 0.5))
+    return int(math.floor(x + 0.5))  # same as C round()
 
 
 def humidity_to_servo_angle(humidity):
     humidity = clamp(humidity, 0.0, 100.0)
     if humidity <= 70.0:
         return round_half_up(humidity / 70.0 * 50.0)
-
     excess = humidity - 70.0
     minimum = 100.0
-    maximum = 1.05 ** 30 * 100.0
-    scaled = (1.05 ** excess * 100.0 - minimum) / (maximum - minimum)
+    maximum = 1.05**30 * 100.0
+    scaled = (1.05**excess * 100.0 - minimum) / (maximum - minimum)
     return round_half_up(clamp(50.0 + scaled * 130.0, 0.0, 180.0))
 
 
 def sweep_duration_for_precipitation(precipitation):
-    rain_strength = clamp(precipitation / RAIN_FOR_MAX_SPEED_MM_H, 0.0, 1.0)
-    return DRY_SWEEP_DURATION_S - rain_strength * (
+    """Full-cycle time in seconds: DRY with no rain, blending to WET at max rain."""
+    rain = clamp(precipitation / RAIN_FOR_MAX_SPEED_MM_H, 0.0, 1.0)
+    return DRY_SWEEP_DURATION_S - rain * (
         DRY_SWEEP_DURATION_S - WET_SWEEP_DURATION_S
     )
 
 
-# ----------------------------------------------------------------------------
-# Weather API
-# ----------------------------------------------------------------------------
+def step_delay_for_weather(angle, precipitation):
+    """Seconds to wait between 1-degree steps."""
+    if angle <= 0:
+        return DRY_SWEEP_DURATION_S
+    return sweep_duration_for_precipitation(precipitation) / (2 * angle)
+
+
+# ---------- weather API (Open-Meteo, no key needed) ----------
+
+
 def fetch_weather(lat, lon):
-    """Return (relative_humidity_percent, precipitation_mm_per_hour)."""
-    query = urllib.parse.urlencode({
+    # Setup the Open-Meteo API client with cache and retry on error
+    cache_session = requests_cache.CachedSession(".cache", expire_after=3600)
+    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    openmeteo = openmeteo_requests.Client(session=retry_session)
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "relative_humidity_2m,precipitation",
-    })
-    url = f"https://api.open-meteo.com/v1/forecast?{query}"
-    with urllib.request.urlopen(url, timeout=10) as response:
-        data = json.load(response)
-    current = data["current"]
-    return float(current["relative_humidity_2m"]), float(current["precipitation"])
+        "current": ["relative_humidity_2m", "precipitation"],
+    }
+    responses = openmeteo.weather_api(url, params=params)
+
+    response = responses[0]
+    current = response.Current()
+
+    current_relative_humidity_2m = current.Variables(0).Value()
+    current_precipitation = current.Variables(1).Value()
+
+    return current_relative_humidity_2m, current_precipitation
 
 
-class WeatherPoller(threading.Thread):
-    """Fetches weather in the background so a slow network never stalls the servos."""
-
-    def __init__(self, lat, lon):
-        super().__init__(daemon=True)
-        self.lat, self.lon = lat, lon
-        self._lock = threading.Lock()
-        self._latest = None
-        self._halt = threading.Event()
-
-    def run(self):
-        while not self._halt.is_set():
-            try:
-                reading = fetch_weather(self.lat, self.lon)
-                with self._lock:
-                    self._latest = reading
-                wait = REFRESH_INTERVAL_S
-            except Exception as exc:  # network down, bad JSON, etc.
-                print(f"Weather fetch failed ({exc}); retrying in {RETRY_INTERVAL_S}s.")
-                wait = RETRY_INTERVAL_S
-            self._halt.wait(wait)
-
-    def take_latest(self):
-        """Return a fresh (humidity, precipitation) once, else None."""
-        with self._lock:
-            reading, self._latest = self._latest, None
-        return reading
-
-    def stop(self):
-        self._halt.set()
+def download_historical_weather(path=HISTORICAL_FILE):
+    """Save the preceding year of hourly Twin Cities weather as a CSV backup."""
+    end = date.today() - timedelta(days=5)  # archive data has a short publication delay
+    start = end - timedelta(days=364)
+    query = urlencode({
+            "latitude": HISTORICAL_LATITUDE,
+            "longitude": HISTORICAL_LONGITUDE,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "hourly": "relative_humidity_2m,precipitation",
+            "timezone": "America/Chicago",
+        })
+    with urlopen(
+        f"https://archive-api.open-meteo.com/v1/archive?{query}", timeout=60
+    ) as response:
+        hourly = json.load(response)["hourly"]
+    rows = zip(hourly["time"], hourly["relative_humidity_2m"], hourly["precipitation"])
+    path = Path(path)
+    with path.open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(("time", "relative_humidity_2m", "precipitation_mm"))
+        writer.writerows(rows)
+    print(f"Saved one year of hourly Twin Cities weather to {path}")
 
 
-# ----------------------------------------------------------------------------
-# Servo motion
-# ----------------------------------------------------------------------------
-class YarnSweeper:
-    def __init__(self, servos):
-        self.servos = servos
-        self.angle = 0.0
-        self.target = 0
-        self.moving_up = True
-        self.duration_s = DRY_SWEEP_DURATION_S
-        self._last_written = None
+def fetch_historical_fallback(path=HISTORICAL_FILE, now=None):
+    """Use the prior year's reading for the same local month, day, and hour."""
+    now = now or datetime.now()
+    try:
+        target = now.replace(year=now.year - 1)
+    except ValueError:  # February 29 has no matching day in a non-leap year.
+        target = now.replace(year=now.year - 1, day=28)
+    with Path(path).open(newline="", encoding="utf-8") as source:
+        rows = list(csv.DictReader(source))
+    if not rows:
+        raise ValueError(f"Historical weather backup is empty: {path}")
+    row = min(rows, key=lambda item: abs(
+        (datetime.fromisoformat(item["time"]) - target).total_seconds()
+    ))
+    return float(row["relative_humidity_2m"]), float(row["precipitation_mm"])
 
-    def apply_weather(self, humidity, precipitation):
-        humidity = clamp(humidity, 0.0, 100.0)
-        precipitation = max(0.0, precipitation)
-        self.target = humidity_to_servo_angle(humidity)
-        self.duration_s = sweep_duration_for_precipitation(precipitation)
 
-        if self.target == 0:
-            self.angle = 0.0
-            self.moving_up = True
-        elif self.angle >= self.target:
-            self.moving_up = False
-        elif self.angle <= 0:
-            self.moving_up = True
-
-        print(
-            f"Humidity: {humidity:.1f}% | Precipitation: {precipitation:.2f} mm/h | "
-            f"Target: {self.target} deg | Full sweep: {self.duration_s:.1f} s"
-        )
-
-    def update(self, dt):
-        """Advance the sweep by dt seconds."""
-        if self.target > 0:
-            step = (2.0 * self.target / self.duration_s) * dt  # deg this tick
-            if self.moving_up:
-                self.angle += step
-                if self.angle >= self.target:
-                    self.angle = float(self.target)
-                    self.moving_up = False
-            else:
-                self.angle -= step
-                if self.angle <= 0:
-                    self.angle = 0.0
-                    self.moving_up = True
-        self._write(self.angle)
-
-    def _write(self, angle):
-        angle = round(clamp(angle, 0.0, 180.0), 1)
-        if angle == self._last_written:
-            return
-        self._last_written = angle
-        for servo in self.servos:
-            servo.angle = angle
-
-    def park(self):
-        self._write(0.0)
-        time.sleep(0.5)
+# ---------- servos ----------
 
 
 def make_pin_factory():
-    """Prefer pigpio (hardware-timed PWM, no jitter); fall back to gpiozero's default."""
     try:
         from gpiozero.pins.pigpio import PiGPIOFactory
+
         return PiGPIOFactory()
     except Exception as exc:
-        print(f"pigpio unavailable ({exc}); using default pin factory (servos may jitter).")
+        print(f"pigpio not available ({exc}); using default pin factory.")
         return None
 
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Weather yarn servo controller")
-    parser.add_argument("--lat", type=float, default=LATITUDE)
-    parser.add_argument("--lon", type=float, default=LONGITUDE)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lat", type=float, default=44.97997)
+    parser.add_argument("--lon", type=float, default=-93.26384)
+    parser.add_argument(
+        "--historical", action="store_true",
+        help="download and save the past year of hourly Twin Cities humidity and precipitation, then exit",
+    )
+    parser.add_argument(
+        "--pins",
+        help="BCM GPIO numbers of the servo signal wires, e.g. 17,18,27,22,23,24",
+    )
     args = parser.parse_args()
+    if args.historical:
+        download_historical_weather()
+        return
     if args.lat is None or args.lon is None:
-        parser.error("set --lat and --lon (or LATITUDE / LONGITUDE at the top of the file)")
+        parser.error(
+            "set --lat and --lon (or LATITUDE / LONGITUDE in the file)"
+        )
 
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # clean stop under systemd
-
+    pins = [int(p) for p in args.pins.split(",")] if args.pins else SERVO_PINS
     factory = make_pin_factory()
+    print(
+        f"Pin factory: {type(factory).__name__ if factory else 'gpiozero default'} | BCM pins: {pins}"
+    )
     servos = [
         AngularServo(
             pin,
             min_angle=0,
             max_angle=180,
             initial_angle=0,
-            min_pulse_width=MIN_PULSE_S,
-            max_pulse_width=MAX_PULSE_S,
+            min_pulse_width=0.544 / 1000,
+            max_pulse_width=2.4 / 1000,
             pin_factory=factory,
         )
-        for pin in SERVO_PINS
+        for pin in pins
     ]
 
-    sweeper = YarnSweeper(servos)
-    poller = WeatherPoller(args.lat, args.lon)
-    poller.start()
+    def write_all(angle):
+        for servo in servos:
+            servo.angle = angle
+
+    angle = 0
+    target = 0
+    moving_up = True
+    step_delay = 1.0
+    next_refresh = 0.0
     print("Weather yarn servo controller ready.")
 
-    last = time.monotonic()
     try:
         while True:
-            now = time.monotonic()
-            dt = min(now - last, 0.5)  # guard against long stalls
-            last = now
+            # ---- refresh weather every 15 minutes ----
+            if time.monotonic() >= next_refresh:
+                try:
+                    humidity, precipitation = fetch_weather(
+                        args.lat, args.lon
+                    )
+                    target = humidity_to_servo_angle(humidity)
+                    step_delay = step_delay_for_weather(target, precipitation)
+                    sweep_s = sweep_duration_for_precipitation(precipitation)
+                    next_refresh = time.monotonic() + REFRESH_S
+                    print(
+                        f"Humidity: {humidity:.1f}% | Precipitation: {precipitation:.2f} mm/h | "
+                        f"Target: {target} deg | Full sweep: {sweep_s:.1f} s | "
+                        f"Step delay: {step_delay * 1000:.0f} ms"
+                    )
+                    if target == 0:
+                        print(
+                            "Target is 0 deg (humidity too low), so the servos stay put."
+                        )
+                except Exception as exc:
+                    try:
+                        humidity, precipitation = fetch_historical_fallback()
+                        target = humidity_to_servo_angle(humidity)
+                        step_delay = step_delay_for_weather(target, precipitation)
+                        next_refresh = time.monotonic() + REFRESH_S
+                        print(
+                            f"Live weather failed ({exc}); using prior-year reading "
+                            f"from {datetime.now().year - 1} ({humidity:.1f}% RH, "
+                            f"{precipitation:.2f} mm precipitation)."
+                        )
+                    except Exception as fallback_exc:
+                        next_refresh = time.monotonic() + RETRY_S
+                        print(
+                            f"Weather fetch failed ({exc}) and historical fallback is unavailable "
+                            f"({fallback_exc}); keeping current target, retry in {RETRY_S}s."
+                        )
 
-            reading = poller.take_latest()
-            if reading is not None:
-                sweeper.apply_weather(*reading)
+                if target == 0:
+                    angle, moving_up = 0, True
+                    write_all(0)
+                elif angle >= target:
+                    moving_up = False
 
-            sweeper.update(dt)
-            time.sleep(TICK_S)
+            if target <= 0:
+                time.sleep(1)
+                continue
+
+            # ---- one 1-degree step, back and forth between 0 and target ----
+            if moving_up:
+                angle += 1
+                if angle >= target:
+                    angle = target
+                    moving_up = False
+            else:
+                angle -= 1
+                if angle <= 0:
+                    angle = 0
+                    moving_up = True
+            write_all(angle)
+            time.sleep(step_delay)
+
     except KeyboardInterrupt:
         pass
     finally:
-        poller.stop()
-        sweeper.park()
+        write_all(0)
+        time.sleep(0.5)
         for servo in servos:
             servo.detach()
             servo.close()
